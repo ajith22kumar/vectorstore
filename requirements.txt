@@ -4,4 +4,4 @@ pydantic-settings
 chromadb
 sentence-transformers
 neo4j
-openai
+openAI

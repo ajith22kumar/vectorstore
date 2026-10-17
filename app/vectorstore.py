@@ -21,10 +21,22 @@ def search_chunks(query, top_k):
     )
     chunks = []
     for i in range(len(results["ids"][0])):
-        chunk = {
+                distance = results["distances"][0][i]
+    chunk = {
             "id": results["ids"][0][i],
             "text": results["documents"][0][i],
-            "source": results["metadatas"][0][i]["source"]
+            "source": results["metadatas"][0][i]["source"],
+            "distance": round(distance, 4),
+            "score": round(1 - distance, 4),
         }
-        chunks.append(chunk)
+    chunks.append(chunk)
     return chunks
+def count_chunks():
+    return collection.count()
+
+def list_chunks(limit=100):
+    data = collection.get(limit=limit, include=["documents", "metadatas"])
+    return [
+        {"id": data["ids"][i], "text": data["documents"][i], "source": data["metadatas"][i]["source"]}
+        for i in range(len(data["ids"]))
+    ]

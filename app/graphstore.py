@@ -30,10 +30,8 @@ def save_chunk(chunk_id, source_id, entities, relations):
         if clean_entities:
             session.run(
                 """
-                MATCH (c:Chunk {id: $chunk_id})
-                UNWIND $entities AS ent
-                MERGE (e:Entity {id: toLower(ent.name)})
-                ON CREATE SET e.name = ent.name, e.type = ent.type
+                MATCH (c:Chunk {id: $chunk_id}) UNWIND $entities AS ent
+                MERGE (e:Entity {id: toLower(ent.name)}) ON CREATE SET e.name = ent.name, e.type = ent.type
                 MERGE (c)-[:MENTIONS]->(e)
                 """,
                 chunk_id=chunk_id,
@@ -42,27 +40,46 @@ def save_chunk(chunk_id, source_id, entities, relations):
         if clean_relations:
             session.run(
                 """
-                UNWIND $relations AS rel
-                MERGE (e1:Entity {id: toLower(rel.source)})
-                ON CREATE SET e1.name = rel.source
-                MERGE (e2:Entity {id: toLower(rel.target)})
-                ON CREATE SET e2.name = rel.target
-                MERGE (e1)-[x:RELATED_TO {type: rel.type}]->(e2)
-                SET x.chunk_id = $chunk_id
+                UNWIND $relations AS rel MERGE (e1:Entity {id: toLower(rel.source)}) ON CREATE SET e1.name = rel.source
+                MERGE (e2:Entity {id: toLower(rel.target)}) ON CREATE SET e2.name = rel.target
+                MERGE (e1)-[x:RELATED_TO {type: rel.type}]->(e2) SET x.chunk_id = $chunk_id
                 """,
                 relations=clean_relations,
                 chunk_id=chunk_id,
             )
-def get_facts(chunk_id):
+def get_facts(chunk_ids, question):
+    q = question.lower()
     with driver.session() as session:
+        rows = session.run("MATCH (c:Chunk)-[:MENTIONS]->(e:Entity) WHERE c.id IN $ids RETURN DISTINCT e.id AS id",ids=chunk_ids,)
+        seeds = {row["id"] for row in rows}
+        rows = session.run("MATCH (e:Entity) WHERE size(e.id) > 2 AND $q CONTAINS e.id RETURN e.id AS id",q=q,)
+        seeds |= {row["id"] for row in rows}
+        if not seeds:
+            return []
         result = session.run(
             """
-            MATCH (c:Chunk {id: $chunk_id})-[:MENTIONS]->(e:Entity)
-            MATCH (e)-[r:RELATED_TO]-(o:Entity)
-            RETURN DISTINCT startNode(r).name AS source,
-                            r.type AS relation,
-                            endNode(r).name AS target
+            MATCH (e:Entity) WHERE e.id IN $seeds
+            MATCH p = (e)-[:RELATED_TO*1..2]-(o:Entity) UNWIND relationships(p) AS r
+            RETURN DISTINCT startNode(r).name AS source, r.type AS relation,endNode(r).name AS target LIMIT 60
             """,
-            chunk_id=chunk_id,
-        )
+            seeds=list(seeds),)
         return [dict(row) for row in result]
+def get_stats():
+    with driver.session() as session:
+        nodes = {r["label"]: r["count"] for r in session.run(
+            "MATCH (n) RETURN labels(n)[0] AS label, count(*) AS count")}
+        rels = {r["type"]: r["count"] for r in session.run(
+            "MATCH ()-[r]->() RETURN type(r) AS type, count(*) AS count")}
+    return {"nodes": nodes, "relationships": rels}
+
+def get_graph(limit=150):
+    with driver.session() as session:
+        rows = session.run(
+            """
+            MATCH (a:Entity)-[r:RELATED_TO]->(b:Entity)
+            RETURN a.name AS source, r.type AS relation, b.name AS target
+            LIMIT $limit
+            """,
+            limit=limit,
+        )
+        return [dict(r) for r in rows]
