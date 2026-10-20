@@ -1,5 +1,9 @@
 from pydantic_settings import BaseSettings
 class Settings(BaseSettings):
+    redis_url: str = ""            # empty = use in-memory cache
+    answer_cache_ttl: int = 3600
+    graph_cache_ttl: int = 2592000
+    rate_limit_per_minute: int = 30
     openai_api_key: str
     llm_base_url: str = "https://api.groq.com/openai/v1"
     llm_model: str = "gpt-4"

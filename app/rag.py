@@ -1,6 +1,7 @@
 import hashlib
 import re
 import time
+from .cache import cache, make_key, index_version, bump_index_version
 from . import graphstore, vectorstore, llm
 from .config import settings
 def split_text(text):
@@ -19,12 +20,20 @@ def split_text(text):
 
 def make_chunk_id(source, text):
     return hashlib.sha1((source + "|" + text).encode("utf-8")).hexdigest()[:16]
+
 def extract_with_retry(chunk):
+    key = make_key("graph", settings.llm_model, chunk)
+    cached = cache.get(key)
+    if cached is not None:
+        return cached
     try:
-        return llm.extract_graph(chunk)
+        graph = llm.extract_graph(chunk)
     except Exception:
         time.sleep(3)
-        return llm.extract_graph(chunk)
+        graph = llm.extract_graph(chunk)
+    if graph["entities"] or graph["relations"]:  
+        cache.set(key, graph, settings.graph_cache_ttl)
+    return graph
 
 def ingest(text, source):
     chunks = split_text(text)
@@ -41,22 +50,36 @@ def ingest(text, source):
             total_relations += len(graph["relations"])
         except Exception as e:
             errors.append(str(e)[:200])
+    bump_index_version()
     return {
         "chunks": len(chunks),
         "entities": total_entities,
         "relations": total_relations,
         "failed_chunks": len(errors),
         "errors": errors[:3],
+        
     }
 
 def ask(question):
+    key = make_key("answer", index_version(), settings.llm_model, question.strip().lower())
+    cached = cache.get(key)
+    if cached is not None:
+        return {**cached, "cached": True}
+    timings = {}
+    t = time.perf_counter()
     found = vectorstore.search_chunks(question, settings.top_k)
+    timings["vector_search_ms"] = round((time.perf_counter() - t) * 1000)
     chunks = [c for c in found if c["distance"] <= settings.max_distance]
     if not chunks:
-        return {"question": question, "answer": llm.NO_ANSWER, "sources": [], "graph_facts": []}
+        return {"question": question, "answer": llm.NO_ANSWER, "sources": [],
+                "graph_facts": [], "timings": timings, "cached": False}
+    t = time.perf_counter()
     facts = graphstore.get_facts([c["id"] for c in chunks], question)
+    timings["graph_ms"] = round((time.perf_counter() - t) * 1000)
+    t = time.perf_counter()
     answer = llm.answer_question(question, chunks, facts)
-    return {
+    timings["llm_ms"] = round((time.perf_counter() - t) * 1000)
+    result = {
         "question": question,
         "answer": answer,
         "sources": [
@@ -64,4 +87,7 @@ def ask(question):
             for i, c in enumerate(chunks)
         ],
         "graph_facts": facts,
+        "timings": timings,
     }
+    cache.set(key, result, settings.answer_cache_ttl)
+    return {**result, "cached": False}
