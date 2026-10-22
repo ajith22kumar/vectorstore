@@ -17,4 +17,8 @@ class Settings(BaseSettings):
     chroma_dir: str = "./chroma_data"
     embedding_model: str = "sentence-transformers/all-MiniLM-L6-v2"
     model_config = {"env_file": ".env"}
+    graph_hops: int = 2
+    graph_chunk_limit: int = 4
+    final_chunks: int = 6
+    rrf_k: int = 60
 settings = Settings()

@@ -60,33 +60,78 @@ def ingest(text, source):
         
     }
 
+def vector_retrieve(question):
+    found = vectorstore.search_chunks(question, settings.top_k)
+    return [c for c in found if c["distance"] <= settings.max_distance]
+
+
+def graph_retrieve(question, seeds):
+    seed_ids = [c["id"] for c in seeds]
+    entity_ids = set(graphstore.entities_of_chunks(seed_ids))
+    entity_ids |= set(graphstore.find_entities_in_text(question))
+    if not entity_ids:
+        return [], []
+
+    facts = graphstore.neighbourhood(sorted(entity_ids), settings.graph_hops)
+
+    expanded = set(entity_ids)
+    for f in facts:
+        expanded.add(f["source_id"])
+        expanded.add(f["target_id"])
+
+    chunk_ids = graphstore.chunks_for_entities(sorted(expanded), settings.graph_chunk_limit)
+    return vectorstore.get_many(chunk_ids), facts
+
+
+def reciprocal_rank_fusion(rankings, k=60):
+    merged = {}
+    for name, ranking in rankings:
+        for rank, item in enumerate(ranking, start=1):
+            entry = merged.setdefault(
+                item["id"], {**item, "score": item.get("score", 0), "fused": 0.0, "found_by": []}
+            )
+            entry["fused"] += 1 / (k + rank)
+            entry["found_by"].append(name)
+            entry["score"] = max(entry["score"], item.get("score", 0))
+    return sorted(merged.values(), key=lambda c: c["fused"], reverse=True)
+
 def ask(question):
     key = make_key("answer", index_version(), settings.llm_model, question.strip().lower())
     cached = cache.get(key)
     if cached is not None:
         return {**cached, "cached": True}
+
     timings = {}
+
     t = time.perf_counter()
-    found = vectorstore.search_chunks(question, settings.top_k)
-    timings["vector_search_ms"] = round((time.perf_counter() - t) * 1000)
-    chunks = [c for c in found if c["distance"] <= settings.max_distance]
-    if not chunks:
+    vector_hits = vector_retrieve(question)
+    timings["vector_ms"] = round((time.perf_counter() - t) * 1000)
+
+    t = time.perf_counter()
+    graph_hits, facts = graph_retrieve(question, vector_hits)
+    timings["graph_ms"] = round((time.perf_counter() - t) * 1000)
+
+    fused = reciprocal_rank_fusion(
+        [("vector", vector_hits), ("graph", graph_hits)], settings.rrf_k
+    )[: settings.final_chunks]
+
+    if not fused:
         return {"question": question, "answer": llm.NO_ANSWER, "sources": [],
                 "graph_facts": [], "timings": timings, "cached": False}
+
     t = time.perf_counter()
-    facts = graphstore.get_facts([c["id"] for c in chunks], question)
-    timings["graph_ms"] = round((time.perf_counter() - t) * 1000)
-    t = time.perf_counter()
-    answer = llm.answer_question(question, chunks, facts)
+    answer = llm.answer_question(question, fused, facts)
     timings["llm_ms"] = round((time.perf_counter() - t) * 1000)
+
     result = {
         "question": question,
         "answer": answer,
         "sources": [
-            {"number": i + 1, "source": c["source"], "score": c["score"], "text": c["text"]}
-            for i, c in enumerate(chunks)
+            {"number": i + 1, "id": c["id"], "source": c["source"], "text": c["text"],
+             "similarity": c["score"], "found_by": c["found_by"], "fused_score": round(c["fused"], 4)}
+            for i, c in enumerate(fused)
         ],
-        "graph_facts": facts,
+        "graph_facts": [{"source": f["source"], "relation": f["relation"], "target": f["target"]} for f in facts],
         "timings": timings,
     }
     cache.set(key, result, settings.answer_cache_ttl)

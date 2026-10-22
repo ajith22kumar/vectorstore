@@ -1,15 +1,21 @@
 import json
-from openai import OpenAI
+from openai import OpenAI, OpenAIError, RateLimitError
+from .errors import AppError
 from .config import settings
 client = OpenAI(api_key=settings.openai_api_key, base_url=settings.llm_base_url)
 NO_ANSWER = "I don't know based on the provided documents."
 def ask_llm(prompt, max_tokens=3000):
-    response = client.chat.completions.create(
-        model=settings.llm_model,
-        max_tokens=max_tokens,
-        temperature=0,
-        messages=[{"role": "user", "content": prompt}],
-    )
+    try:
+        response = client.chat.completions.create(
+            model=settings.llm_model,
+            max_tokens=max_tokens,
+            temperature=0,
+            messages=[{"role": "user", "content": prompt}],
+        )
+    except RateLimitError as e:
+        raise AppError(429, "LLM rate limit or quota reached, try again later") from e
+    except OpenAIError as e:
+        raise AppError(502, "LLM call failed: " + str(e)[:150]) from e
     return response.choices[0].message.content or ""
 def extract_graph(text):
     prompt = (

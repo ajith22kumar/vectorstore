@@ -1,3 +1,7 @@
+import uuid
+from fastapi.responses import JSONResponse
+from pydantic import Field
+from .errors import AppError
 import logging
 import time
 from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException
@@ -10,10 +14,10 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger("rag")
 app = FastAPI(title="vector + graph rag")
 class IngestBody(BaseModel):
-    text: str
+    text: str = Field(min_length=1)
     source: str = "manual"
 class QuestionBody(BaseModel):
-    question: str
+    question: str = Field(min_length=3, max_length=500)
 @app.middleware("http")
 async def timing(request, call_next):
     start = time.time()
@@ -21,6 +25,7 @@ async def timing(request, call_next):
     ms = round((time.time() - start) * 1000)
     response.headers["X-Process-Time-ms"] = str(ms)
     log.info("%s %s -> %s in %sms", request.method, request.url.path, response.status_code, ms)
+    response.headers["X-Request-ID"] = uuid.uuid4().hex[:8]
     return response
 @app.get("/")
 def home():
@@ -68,3 +73,11 @@ def health():
         report["graph_db"] = {"ok": False, "error": str(e)[:150]}
     report["ok"] = report["vector_db"]["ok"] and report["graph_db"]["ok"]
     return report
+@app.exception_handler(AppError)
+async def handle_app_error(request, exc):
+    return JSONResponse(status_code=exc.status_code, content={"error": exc.message})
+from neo4j.exceptions import ServiceUnavailable, SessionExpired
+async def handle_db_down(request, exc):
+    return JSONResponse(status_code=503, content={"error": "Graph database is not reachable, try again"})
+app.add_exception_handler(ServiceUnavailable, handle_db_down)
+app.add_exception_handler(SessionExpired, handle_db_down)

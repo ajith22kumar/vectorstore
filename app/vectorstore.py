@@ -40,3 +40,15 @@ def list_chunks(limit=100):
         {"id": data["ids"][i], "text": data["documents"][i], "source": data["metadatas"][i]["source"]}
         for i in range(len(data["ids"]))
     ]
+def get_many(ids):
+    if not ids:
+        return []
+    data = collection.get(ids=ids, include=["documents", "metadatas"])
+    by_id = {}
+    for i in range(len(data["ids"])):
+        by_id[data["ids"][i]] = {
+            "id": data["ids"][i],
+            "text": data["documents"][i],
+            "source": data["metadatas"][i].get("source", ""),
+        }
+    return [by_id[i] for i in ids if i in by_id]

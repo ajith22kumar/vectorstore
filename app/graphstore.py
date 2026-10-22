@@ -1,3 +1,4 @@
+import re
 from neo4j import GraphDatabase
 from .config import settings
 driver = GraphDatabase.driver(
@@ -10,60 +11,98 @@ with driver.session() as session:
     session.run("CREATE CONSTRAINT entity_id IF NOT EXISTS FOR (n:Entity) REQUIRE n.id IS UNIQUE")
     session.run("CREATE CONSTRAINT chunk_id IF NOT EXISTS FOR (c:Chunk) REQUIRE c.id IS UNIQUE")
 def save_chunk(chunk_id, source_id, entities, relations):
-    clean_entities = []
+    entity_map = {}
     for e in entities:
-        if e.get("name"):
-            clean_entities.append({"name": e["name"], "type": e.get("type", "Other")})
+        name = str(e.get("name", "")).strip()
+        key = entity_key(name)
+        if key:
+            entity_map[key] = {"id": key, "name": name, "type": e.get("type", "Other")}
+
     clean_relations = []
     for r in relations:
-        source = r.get("source") or r.get("source_name")
-        target = r.get("target") or r.get("target_name")
-        rel_type = r.get("relation") or r.get("type")
-        if source and target and rel_type:
-            clean_relations.append({"source": source, "target": target, "type": rel_type})
+        source = str(r.get("source") or r.get("source_name") or "").strip()
+        target = str(r.get("target") or r.get("target_name") or "").strip()
+        rel_type = re.sub(r"[^A-Z0-9]+", "_", str(r.get("relation") or r.get("type") or "").upper()).strip("_")
+        sid, tid = entity_key(source), entity_key(target)
+        if sid and tid and rel_type and sid != tid:
+            clean_relations.append({"sid": sid, "sname": source, "tid": tid, "tname": target, "type": rel_type})
+            entity_map.setdefault(sid, {"id": sid, "name": source, "type": "Other"})
+            entity_map.setdefault(tid, {"id": tid, "name": target, "type": "Other"})
+
     with driver.session() as session:
         session.run(
             "MERGE (c:Chunk {id: $chunk_id}) SET c.source_id = $source_id",
-            chunk_id=chunk_id,
-            source_id=source_id,
+            chunk_id=chunk_id, source_id=source_id,
         )
-        if clean_entities:
+        if entity_map:
             session.run(
                 """
-                MATCH (c:Chunk {id: $chunk_id}) UNWIND $entities AS ent
-                MERGE (e:Entity {id: toLower(ent.name)}) ON CREATE SET e.name = ent.name, e.type = ent.type
+                MATCH (c:Chunk {id: $chunk_id})
+                UNWIND $entities AS ent
+                MERGE (e:Entity {id: ent.id})
+                ON CREATE SET e.name = ent.name, e.type = ent.type
                 MERGE (c)-[:MENTIONS]->(e)
                 """,
-                chunk_id=chunk_id,
-                entities=clean_entities,
+                chunk_id=chunk_id, entities=list(entity_map.values()),
             )
         if clean_relations:
             session.run(
                 """
-                UNWIND $relations AS rel MERGE (e1:Entity {id: toLower(rel.source)}) ON CREATE SET e1.name = rel.source
-                MERGE (e2:Entity {id: toLower(rel.target)}) ON CREATE SET e2.name = rel.target
-                MERGE (e1)-[x:RELATED_TO {type: rel.type}]->(e2) SET x.chunk_id = $chunk_id
+                UNWIND $relations AS rel
+                MERGE (a:Entity {id: rel.sid}) ON CREATE SET a.name = rel.sname
+                MERGE (b:Entity {id: rel.tid}) ON CREATE SET b.name = rel.tname
+                MERGE (a)-[x:RELATED_TO {type: rel.type}]->(b)
+                SET x.chunk_id = $chunk_id
                 """,
-                relations=clean_relations,
-                chunk_id=chunk_id,
+                relations=clean_relations, chunk_id=chunk_id,
             )
-def get_facts(chunk_ids, question):
-    q = question.lower()
+def entities_of_chunks(chunk_ids):
     with driver.session() as session:
-        rows = session.run("MATCH (c:Chunk)-[:MENTIONS]->(e:Entity) WHERE c.id IN $ids RETURN DISTINCT e.id AS id",ids=chunk_ids,)
-        seeds = {row["id"] for row in rows}
-        rows = session.run("MATCH (e:Entity) WHERE size(e.id) > 2 AND $q CONTAINS e.id RETURN e.id AS id",q=q,)
-        seeds |= {row["id"] for row in rows}
-        if not seeds:
-            return []
-        result = session.run(
-            """
-            MATCH (e:Entity) WHERE e.id IN $seeds
-            MATCH p = (e)-[:RELATED_TO*1..2]-(o:Entity) UNWIND relationships(p) AS r
-            RETURN DISTINCT startNode(r).name AS source, r.type AS relation,endNode(r).name AS target LIMIT 60
+        rows = session.run(
+            "MATCH (c:Chunk)-[:MENTIONS]->(e:Entity) WHERE c.id IN $ids RETURN DISTINCT e.id AS id",
+            ids=chunk_ids,
+        )
+        return [r["id"] for r in rows]
+
+
+def find_entities_in_text(text):
+    with driver.session() as session:
+        rows = session.run(
+            "MATCH (e:Entity) WHERE size(e.id) > 2 AND $q CONTAINS e.id RETURN e.id AS id",
+            q=text.lower(),
+        )
+        return [r["id"] for r in rows]
+
+
+def neighbourhood(entity_ids, hops=2):
+    hops = max(1, min(int(hops), 3))
+    with driver.session() as session:
+        rows = session.run(
+            f"""
+            MATCH (e:Entity) WHERE e.id IN $ids
+            MATCH p = (e)-[:RELATED_TO*1..{hops}]-(o:Entity)
+            UNWIND relationships(p) AS r
+            RETURN DISTINCT startNode(r).name AS source, startNode(r).id AS source_id,
+                            r.type AS relation,
+                            endNode(r).name AS target, endNode(r).id AS target_id
+            LIMIT 60
             """,
-            seeds=list(seeds),)
-        return [dict(row) for row in result]
+            ids=entity_ids,
+        )
+        return [dict(r) for r in rows]
+
+
+def chunks_for_entities(entity_ids, limit=4):
+    with driver.session() as session:
+        rows = session.run(
+            """
+            MATCH (c:Chunk)-[:MENTIONS]->(e:Entity) WHERE e.id IN $ids
+            RETURN c.id AS id, count(DISTINCT e) AS hits
+            ORDER BY hits DESC LIMIT $limit
+            """,
+            ids=entity_ids, limit=limit,
+        )
+        return [r["id"] for r in rows]
 def get_stats():
     with driver.session() as session:
         nodes = {r["label"]: r["count"] for r in session.run(
@@ -83,3 +122,10 @@ def get_graph(limit=150):
             limit=limit,
         )
         return [dict(r) for r in rows]
+def entity_key(name):
+    words = re.sub(r"[^\w\s]", " ", str(name).lower()).split()
+    if len(words) > 1 and words[0] == "the":
+        words = words[1:]
+    while len(words) > 1 and words[-1] in {"inc", "corp", "corporation", "ltd", "llc", "co", "company", "plc"}:
+        words.pop()
+    return " ".join(words)
